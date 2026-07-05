@@ -1,0 +1,338 @@
+{
+  "name": "Knowledge Base Ingestion",
+  "nodes": [
+    {
+      "parameters": {},
+      "id": "manual-trigger",
+      "name": "Manual Trigger",
+      "type": "n8n-nodes-base.manualTrigger",
+      "typeVersion": 1,
+      "position": [
+        -1400,
+        0
+      ]
+    },
+    {
+      "parameters": {
+        "operation": "read",
+        "fileSelector": "={{ $env.KB_SOURCE_DIRECTORY }}/*.md",
+        "options": {}
+      },
+      "id": "read-markdown-files",
+      "name": "Read Markdown Files",
+      "type": "n8n-nodes-base.readWriteFile",
+      "typeVersion": 1,
+      "position": [
+        -1180,
+        0
+      ]
+    },
+    {
+      "parameters": {
+        "batchSize": 1,
+        "options": {}
+      },
+      "id": "loop-over-files",
+      "name": "Loop Over Files",
+      "type": "n8n-nodes-base.splitInBatches",
+      "typeVersion": 3,
+      "position": [
+        -960,
+        0
+      ]
+    },
+    {
+      "parameters": {
+        "operation": "text",
+        "binaryPropertyName": "data",
+        "options": {}
+      },
+      "id": "extract-markdown-text",
+      "name": "Extract Markdown Text",
+      "type": "n8n-nodes-base.extractFromFile",
+      "typeVersion": 1,
+      "position": [
+        -720,
+        -80
+      ]
+    },
+    {
+      "parameters": {
+        "language": "javaScript",
+        "jsCode": "// Semantic markdown chunker.\n// Splits the document on level-2 (##) headings, falling back to the\n// whole document under a \"General\" section if no headings are found.\n// Produces one JSON item per document (chunks nested inside), which the\n// next Split Out node will explode into one item per chunk.\n\nconst crypto = require('crypto');\n\nconst text = $input.first().json.data || $input.first().json.text || '';\nconst binary = $input.first().binary && $input.first().binary.data;\nconst fileName = binary ? binary.fileName : ($input.first().json.fileName || 'unknown.md');\n\n// Derive a readable title from the first H1, or from the filename.\nconst h1Match = text.match(/^#\\s+(.+)$/m);\nconst title = h1Match ? h1Match[1].trim() : fileName.replace(/\\.md$/i, '').replace(/[-_]/g, ' ');\n\n// Split into sections by \"## Heading\" boundaries, keeping the heading text.\nconst sectionRegex = /^##\\s+(.+)$/gm;\nlet sections = [];\nlet lastIndex = 0;\nlet lastHeading = 'General';\nlet match;\n\nwhile ((match = sectionRegex.exec(text)) !== null) {\n  const chunkText = text.slice(lastIndex, match.index).trim();\n  if (chunkText.length > 0) {\n    sections.push({ heading: lastHeading, content: chunkText });\n  }\n  lastHeading = match[1].trim();\n  lastIndex = match.index;\n}\n// final trailing section\nconst tail = text.slice(lastIndex).trim();\nif (tail.length > 0) {\n  sections.push({ heading: lastHeading, content: tail });\n}\nif (sections.length === 0) {\n  sections.push({ heading: 'General', content: text.trim() });\n}\n\n// Strip the heading marker itself out of the content body and drop the H1 title line.\nsections = sections.map(s => {\n  let content = s.content\n    .replace(/^##\\s+.+$/m, '')\n    .replace(/^#\\s+.+$/m, '')\n    .trim();\n  return { heading: s.heading, content };\n}).filter(s => s.content.length > 0);\n\n// Further split any very long section (> ~500 tokens ~ 2000 chars) into\n// overlapping sub-chunks so no single chunk overwhelms the context window.\nconst MAX_CHARS = 2000;\nconst OVERLAP_CHARS = 200;\nconst finalChunks = [];\nlet chunkIndex = 0;\n\nfor (const section of sections) {\n  if (section.content.length <= MAX_CHARS) {\n    finalChunks.push({\n      section: section.heading,\n      content: section.content,\n      chunk_index: chunkIndex++\n    });\n  } else {\n    let start = 0;\n    while (start < section.content.length) {\n      const end = Math.min(start + MAX_CHARS, section.content.length);\n      finalChunks.push({\n        section: section.heading,\n        content: section.content.slice(start, end).trim(),\n        chunk_index: chunkIndex++\n      });\n      start = end - OVERLAP_CHARS;\n      if (start <= 0 || end === section.content.length) break;\n    }\n  }\n}\n\nconst checksum = 'sha256:' + crypto.createHash('sha256').update(text).digest('hex');\n\nreturn [{\n  json: {\n    title,\n    source_path: fileName,\n    checksum,\n    chunks: finalChunks\n  }\n}];\n"
+      },
+      "id": "chunk-markdown",
+      "name": "Chunk Markdown",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [
+        -500,
+        -80
+      ]
+    },
+    {
+      "parameters": {
+        "method": "POST",
+        "url": "={{ $env.SUPABASE_URL }}/rest/v1/documents",
+        "authentication": "genericCredentialType",
+        "genericAuthType": "httpHeaderAuth",
+        "sendHeaders": true,
+        "headerParameters": {
+          "parameters": [
+            {
+              "name": "apikey",
+              "value": "={{ $env.SUPABASE_SERVICE_ROLE_KEY }}"
+            },
+            {
+              "name": "Authorization",
+              "value": "=Bearer {{ $env.SUPABASE_SERVICE_ROLE_KEY }}"
+            },
+            {
+              "name": "Content-Type",
+              "value": "application/json"
+            },
+            {
+              "name": "Prefer",
+              "value": "resolution=merge-duplicates,return=representation"
+            }
+          ]
+        },
+        "sendBody": true,
+        "specifyBody": "json",
+        "jsonBody": "={{ { \"title\": $json.title, \"source_path\": $json.source_path, \"checksum\": $json.checksum } }}",
+        "options": {}
+      },
+      "id": "upsert-document",
+      "name": "Upsert Document",
+      "type": "n8n-nodes-base.httpRequest",
+      "typeVersion": 4.2,
+      "position": [
+        -280,
+        -80
+      ]
+    },
+    {
+      "parameters": {
+        "language": "javaScript",
+        "jsCode": "const doc = $input.first().json[0] || $input.first().json;\nconst chunkData = $('Chunk Markdown').first().json;\nconst documentId = doc.id;\nconst documentTitle = doc.title;\n\nreturn chunkData.chunks.map(c => ({\n  json: {\n    document_id: documentId,\n    document_title: documentTitle,\n    section: c.section,\n    chunk_index: c.chunk_index,\n    content: c.content\n  }\n}));\n"
+      },
+      "id": "attach-document-id",
+      "name": "Attach Document Id",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [
+        -60,
+        -80
+      ]
+    },
+    {
+      "parameters": {
+        "method": "POST",
+        "url": "https://api.openai.com/v1/embeddings",
+        "authentication": "genericCredentialType",
+        "genericAuthType": "httpHeaderAuth",
+        "sendHeaders": true,
+        "headerParameters": {
+          "parameters": [
+            {
+              "name": "Authorization",
+              "value": "=Bearer {{ $env.OPENAI_API_KEY }}"
+            },
+            {
+              "name": "Content-Type",
+              "value": "application/json"
+            }
+          ]
+        },
+        "sendBody": true,
+        "specifyBody": "json",
+        "jsonBody": "={{ { \"model\": $env.OPENAI_EMBEDDING_MODEL, \"input\": $json.content } }}",
+        "options": {}
+      },
+      "id": "create-embedding",
+      "name": "Create Embedding",
+      "type": "n8n-nodes-base.httpRequest",
+      "typeVersion": 4.2,
+      "position": [
+        160,
+        -80
+      ]
+    },
+    {
+      "parameters": {
+        "language": "javaScript",
+        "jsCode": "const items = $input.all();\nreturn items.map((item, i) => {\n  const embedding = item.json.data[0].embedding;\n  const chunkMeta = $('Attach Document Id').all()[i].json;\n  return {\n    json: {\n      ...chunkMeta,\n      embedding,\n      token_count: item.json.usage ? item.json.usage.total_tokens : null\n    }\n  };\n});\n"
+      },
+      "id": "merge-embedding",
+      "name": "Merge Embedding",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [
+        380,
+        -80
+      ]
+    },
+    {
+      "parameters": {
+        "method": "POST",
+        "url": "={{ $env.SUPABASE_URL }}/rest/v1/document_chunks",
+        "authentication": "genericCredentialType",
+        "genericAuthType": "httpHeaderAuth",
+        "sendHeaders": true,
+        "headerParameters": {
+          "parameters": [
+            {
+              "name": "apikey",
+              "value": "={{ $env.SUPABASE_SERVICE_ROLE_KEY }}"
+            },
+            {
+              "name": "Authorization",
+              "value": "=Bearer {{ $env.SUPABASE_SERVICE_ROLE_KEY }}"
+            },
+            {
+              "name": "Content-Type",
+              "value": "application/json"
+            },
+            {
+              "name": "Prefer",
+              "value": "return=minimal"
+            }
+          ]
+        },
+        "sendBody": true,
+        "specifyBody": "json",
+        "jsonBody": "={{ { \"document_id\": $json.document_id, \"document_title\": $json.document_title, \"section\": $json.section, \"chunk_index\": $json.chunk_index, \"content\": $json.content, \"token_count\": $json.token_count, \"embedding\": $json.embedding } }}",
+        "options": {}
+      },
+      "id": "insert-chunk",
+      "name": "Insert Chunk",
+      "type": "n8n-nodes-base.httpRequest",
+      "typeVersion": 4.2,
+      "position": [
+        600,
+        -80
+      ]
+    }
+  ],
+  "connections": {
+    "Manual Trigger": {
+      "main": [
+        [
+          {
+            "node": "Read Markdown Files",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Read Markdown Files": {
+      "main": [
+        [
+          {
+            "node": "Loop Over Files",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Loop Over Files": {
+      "main": [
+        [
+          {
+            "node": "Extract Markdown Text",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Extract Markdown Text": {
+      "main": [
+        [
+          {
+            "node": "Chunk Markdown",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Chunk Markdown": {
+      "main": [
+        [
+          {
+            "node": "Upsert Document",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Upsert Document": {
+      "main": [
+        [
+          {
+            "node": "Attach Document Id",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Attach Document Id": {
+      "main": [
+        [
+          {
+            "node": "Create Embedding",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Create Embedding": {
+      "main": [
+        [
+          {
+            "node": "Merge Embedding",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Merge Embedding": {
+      "main": [
+        [
+          {
+            "node": "Insert Chunk",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Insert Chunk": {
+      "main": [
+        [
+          {
+            "node": "Loop Over Files",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    }
+  },
+  "active": false,
+  "settings": {
+    "executionOrder": "v1"
+  },
+  "versionId": "00000000-0000-0000-0000-000000000001",
+  "meta": {
+    "templateCredsSetupCompleted": false
+  },
+  "tags": []
+}
